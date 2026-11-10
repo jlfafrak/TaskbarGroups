@@ -1,0 +1,72 @@
+name: Windows CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Validate and build MSI
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install .NET 6 for WiX
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6
+        with:
+          dotnet-version: 6.0.x
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          ./tests/release-version.ps1
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $version = ($metadata.packages | Where-Object name -eq 'taskbar-groups').version
+            ./installer/validate-release-version.ps1 -Tag $env:GITHUB_REF_NAME -Version $version
+          }
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build MSI
+        shell: pwsh
+        run: ./installer/build-msi.ps1
+      - name: Test installation and upgrades
+        shell: pwsh
+        run: ./tests/installer-smoke.ps1
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: taskbar-groups-msi
+          path: target/installer/TaskbarGroups-*-x64.msi
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified MSI
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: taskbar-groups-msi
+          path: installer
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" installer/*.msi --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

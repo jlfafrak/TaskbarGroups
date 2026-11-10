@@ -20,6 +20,10 @@ Install the Rust MSVC toolchain and Microsoft C++ build tools, plus a .NET runti
 
 The script downloads and verifies WiX 5.0.2 from NuGet on its first run, builds the release executable separately, and writes the MSI to `target\installer`. WiX 5 is out of support; the pinned version avoids requiring acceptance of the newer WiX maintenance-fee EULA. Each release must increase the three-part version in `Cargo.toml`; Windows Installer uses those three parts for upgrades (maximum 255.255.65535). Keep the installer's upgrade and component IDs unchanged between releases.
 
+## GitHub builds and releases
+
+GitHub Actions runs the Windows Rust checks, builds the MSI, and tests installation and upgrades on pushes to `main` and pull requests. Successful runs provide the MSI as a workflow artifact. To publish a release, update the package version and `Cargo.lock`, commit and push the changes, then create and push the matching tag (for example, `git tag v0.2.0` followed by `git push origin v0.2.0`). The tag must exactly match the three-part package version and stay within Windows Installer's version limits. After all checks pass, Actions creates a GitHub Release with the MSI attached and automatically generated notes. The published MSI is unsigned.
+
 ## Build and run from source
 
 Install the Rust MSVC toolchain and Microsoft C++ build tools, then run:

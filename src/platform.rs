@@ -86,6 +86,189 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
+struct ShutdownSignal(isize);
+impl ShutdownSignal {
+    fn new(name: &str) -> Result<Self, String> {
+        use windows::Win32::System::Threading::CreateEventW;
+        let name = wide(name);
+        let handle = unsafe { CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }
+            .map_err(|error| error.to_string())?;
+        Ok(Self(handle.0 as isize))
+    }
+    fn is_set(&self) -> bool {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(HANDLE(self.0 as *mut _), 0) == WAIT_OBJECT_0 }
+    }
+    fn trigger(&self) -> Result<(), String> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::SetEvent;
+        unsafe { SetEvent(HANDLE(self.0 as *mut _)) }.map_err(|error| error.to_string())
+    }
+    fn reset(&self) -> Result<(), String> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::ResetEvent;
+        unsafe { ResetEvent(HANDLE(self.0 as *mut _)) }.map_err(|error| error.to_string())
+    }
+}
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        let _ = unsafe { CloseHandle(HANDLE(self.0 as *mut _)) };
+    }
+}
+
+fn shutdown_signal() -> Option<&'static ShutdownSignal> {
+    use std::hash::{Hash, Hasher};
+    static SIGNAL: OnceLock<Option<ShutdownSignal>> = OnceLock::new();
+    SIGNAL
+        .get_or_init(|| {
+            let path = std::env::current_exe()
+                .ok()?
+                .to_string_lossy()
+                .to_lowercase();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            ShutdownSignal::new(&format!(
+                "Local\\TaskbarGroupsInstallerShutdown-{:016x}",
+                hasher.finish()
+            ))
+            .ok()
+        })
+        .as_ref()
+}
+
+pub fn initialize_installer_shutdown() {
+    let _ = shutdown_signal();
+}
+pub fn installer_shutdown_requested() -> bool {
+    shutdown_signal().is_some_and(ShutdownSignal::is_set)
+}
+pub fn request_installer_shutdown() -> Result<(), String> {
+    let signal = shutdown_signal().ok_or("Could not create the installer shutdown signal")?;
+    signal.trigger()?;
+    let result = wait_for_other_instances(
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+        Duration::from_secs(30),
+    );
+    if result.is_err() {
+        let _ = signal.reset();
+    }
+    result
+}
+
+fn wait_for_other_instances(executable: &Path, timeout: Duration) -> Result<(), String> {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, WAIT_OBJECT_0,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
+    };
+    let expected_name = executable
+        .file_name()
+        .ok_or("Executable has no filename")?
+        .to_string_lossy();
+    let expected_path = executable.to_string_lossy();
+    let started = Instant::now();
+    let mut current_session = 0;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session) }
+        .map_err(|e| e.to_string())?;
+    loop {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+            .map_err(|e| e.to_string())?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut other = false;
+        let mut result = unsafe { Process32FirstW(snapshot, &mut entry) };
+        let mut failure = None;
+        while result.is_ok() {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if entry.th32ProcessID != unsafe { GetCurrentProcessId() }
+                && name.eq_ignore_ascii_case(&expected_name)
+            {
+                match unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        false,
+                        entry.th32ProcessID,
+                    )
+                } {
+                    Ok(process) => {
+                        let mut buffer = [0u16; 32768];
+                        let mut size = buffer.len() as u32;
+                        let query = unsafe {
+                            QueryFullProcessImageNameW(
+                                process,
+                                PROCESS_NAME_WIN32,
+                                PWSTR(buffer.as_mut_ptr()),
+                                &mut size,
+                            )
+                        };
+                        if query.is_ok()
+                            && String::from_utf16_lossy(&buffer[..size as usize])
+                                .eq_ignore_ascii_case(&expected_path)
+                        {
+                            other |= unsafe { WaitForSingleObject(process, 0) } != WAIT_OBJECT_0;
+                        } else if query.is_err()
+                            && unsafe { WaitForSingleObject(process, 0) } != WAIT_OBJECT_0
+                        {
+                            failure = Some(
+                                "Could not verify a running Taskbar Groups process".to_string(),
+                            );
+                        }
+                        let _ = unsafe { CloseHandle(process) };
+                    }
+                    Err(e) if unsafe { GetLastError() } != ERROR_INVALID_PARAMETER => {
+                        let mut session = 0;
+                        if unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut session) }
+                            .is_ok()
+                            && session == current_session
+                        {
+                            failure = Some(e.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+            result = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+        if failure.is_none() && result.is_err() && unsafe { GetLastError() } != ERROR_NO_MORE_FILES
+        {
+            failure = Some("Could not enumerate running processes".into());
+        }
+        let _ = unsafe { CloseHandle(snapshot) };
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if !other {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(
+                "Taskbar Groups is still busy. Finish the current drag and retry the installation."
+                    .into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 struct ComApartment(bool);
 impl ComApartment {
     fn new() -> Self {
@@ -366,7 +549,7 @@ fn drag_effect_is_accepted(effect: DROPEFFECT, on_taskbar: bool) -> bool {
     on_taskbar && effect.0 & 7 != 0
 }
 
-fn packaged_app_id(path: &Path) -> Option<String> {
+pub(crate) fn packaged_app_id(path: &Path) -> Option<String> {
     if !path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
@@ -1374,7 +1557,7 @@ fn start_menu_shortcut_by_identity_name(
     .map_err(|_| "Shortcut resolution thread failed".to_string())?
 }
 
-fn msi_shortcut_target(path: &Path) -> Option<PathBuf> {
+pub(crate) fn msi_shortcut_target(path: &Path) -> Option<PathBuf> {
     unsafe {
         let mut product = [0u16; 39];
         let mut component = [0u16; 39];
@@ -1996,6 +2179,16 @@ fn calculate_position(
     icons_per_row: usize,
     extra_height: f32,
 ) -> Option<(i32, i32)> {
+    let (width, height) = taskbar_groups::flyout_size_with_columns(count, icons_per_row);
+    calculate_position_sized(root, anchor, width, height + extra_height)
+}
+
+fn calculate_position_sized(
+    root: HWND,
+    anchor: windows::Win32::Foundation::RECT,
+    width: f32,
+    height: f32,
+) -> Option<(i32, i32)> {
     unsafe {
         let point = POINT {
             x: (anchor.left + anchor.right) / 2,
@@ -2017,13 +2210,12 @@ fn calculate_position(
             right: r.right,
             bottom: r.bottom,
         };
-        let (width, height) = taskbar_groups::flyout_size_with_columns(count, icons_per_row);
         Some(taskbar_groups::position_flyout(
             rect(info.rcWork),
             rect(bar),
             rect(anchor),
             width,
-            height + extra_height,
+            height,
             GetDpiForWindow(root) as f32 / 96.0,
         ))
     }
@@ -2034,6 +2226,15 @@ pub fn position_at_anchor(
     count: usize,
     icons_per_row: usize,
     extra_height: f32,
+) -> Option<(i32, i32)> {
+    let (width, height) = taskbar_groups::flyout_size_with_columns(count, icons_per_row);
+    position_at_anchor_sized(anchor, width, height + extra_height)
+}
+
+pub fn position_at_anchor_sized(
+    anchor: taskbar_groups::Rect,
+    width: f32,
+    height: f32,
 ) -> Option<(i32, i32)> {
     unsafe {
         let point = POINT {
@@ -2047,7 +2248,7 @@ pub fn position_at_anchor(
         if name != "Shell_TrayWnd" && name != "Shell_SecondaryTrayWnd" {
             return None;
         }
-        calculate_position(
+        calculate_position_sized(
             root,
             windows::Win32::Foundation::RECT {
                 left: anchor.left,
@@ -2055,9 +2256,8 @@ pub fn position_at_anchor(
                 right: anchor.right,
                 bottom: anchor.bottom,
             },
-            count,
-            icons_per_row,
-            extra_height,
+            width,
+            height,
         )
     }
 }
@@ -2067,7 +2267,10 @@ pub fn taskbar_position_for_group(
     icons_per_row: usize,
 ) -> Option<((i32, i32), taskbar_groups::Rect)> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let apartment = ComApartment::new();
+        if !apartment.0 {
+            return None;
+        }
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
         let mut cursor = POINT::default();
@@ -2146,6 +2349,20 @@ pub fn taskbar_position_for_group(
         }
         None
     }
+}
+
+pub(crate) fn group_has_accessible_pin(group: &Group, icons_per_row: usize) -> bool {
+    let Some(dir) = taskbar_pin_directory() else {
+        return false;
+    };
+    if pinned_shortcut_for_app_id_in_apartment(&dir, &app_id(&group.id))
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return false;
+    }
+    taskbar_position_for_group(group, icons_per_row).is_some()
 }
 
 struct ActivePinDrag {
@@ -2588,6 +2805,7 @@ pub fn watch(path: &Path) {
             let _ = repair_generated_names(&repair_path);
         });
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _window_monitor = crate::managed_windows::start(path.to_owned());
         let automation: IUIAutomation =
             match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
                 Ok(a) => a,
@@ -2610,6 +2828,9 @@ pub fn watch(path: &Path) {
         let mut drag: Option<ActivePinDrag> = None;
         loop {
             std::thread::sleep(Duration::from_millis(30));
+            if installer_shutdown_requested() && drag.is_none() {
+                break;
+            }
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_err() {
                 continue;
@@ -2922,6 +3143,41 @@ pub fn watch(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installer_shutdown_signal_reaches_other_process_handles() {
+        let name = format!("Local\\TaskbarGroupsShutdownTest-{}", uuid::Uuid::new_v4());
+        let listener = ShutdownSignal::new(&name).unwrap();
+        let sender = ShutdownSignal::new(&name).unwrap();
+        assert!(!listener.is_set());
+        sender.trigger().unwrap();
+        assert!(listener.is_set());
+        sender.reset().unwrap();
+        assert!(!listener.is_set());
+    }
+    #[test]
+    fn installer_waits_for_running_instances_before_replacing_the_executable() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(&executable)
+            .args([
+                "--exact",
+                "platform::tests::installer_wait_child",
+                "--ignored",
+            ])
+            .spawn()
+            .unwrap();
+        let result = wait_for_other_instances(&executable, Duration::from_millis(100));
+        assert!(
+            result.is_err(),
+            "a running process should prevent shutdown from succeeding"
+        );
+        child.wait().unwrap();
+        assert!(wait_for_other_instances(&executable, Duration::from_secs(2)).is_ok());
+    }
+    #[test]
+    #[ignore = "child process used by the installer shutdown test"]
+    fn installer_wait_child() {
+        std::thread::sleep(Duration::from_millis(800));
+    }
     #[test]
     fn startup_status_respects_the_shortcut_and_windows_approval() {
         let dir = tempfile::tempdir().unwrap();

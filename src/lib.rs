@@ -3,12 +3,17 @@ use std::{fs, io, path::Path};
 use uuid::Uuid;
 
 pub mod pin_recovery;
+pub mod window_recovery;
 
 pub const DEFAULT_ICONS_PER_ROW: usize = 4;
 pub const MAX_ICONS_PER_ROW: usize = 12;
 
 fn default_icons_per_row() -> usize {
     DEFAULT_ICONS_PER_ROW
+}
+
+fn default_hide_taskbar_button() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +41,8 @@ pub struct App {
     pub id: Uuid,
     pub name: String,
     pub path: String,
+    #[serde(default = "default_hide_taskbar_button")]
+    pub hide_taskbar_button: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +94,7 @@ impl Store {
             id: Uuid::new_v4(),
             name: name.trim().into(),
             path: path.into(),
+            hide_taskbar_button: true,
         });
         Ok(())
     }

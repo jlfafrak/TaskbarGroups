@@ -212,6 +212,23 @@ pub fn show_external_insertion(
     Some(marker)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum IconAction {
+    Launch,
+    Activate,
+    Choose,
+}
+
+pub fn icon_action(windows: usize, shift: bool) -> IconAction {
+    if shift || windows == 0 {
+        IconAction::Launch
+    } else if windows == 1 {
+        IconAction::Activate
+    } else {
+        IconAction::Choose
+    }
+}
+
 pub fn render_icon(ui: &mut Ui, id: Uuid, name: &str, texture: TextureId) -> Response {
     let image = egui::Image::new((texture, Vec2::splat(32.0)));
     let response = ui
@@ -223,7 +240,9 @@ pub fn render_icon(ui: &mut Ui, id: Uuid, name: &str, texture: TextureId) -> Res
             )
         })
         .inner
-        .on_hover_text(format!("{name}\nDrag to reorder or pin to the taskbar"));
+        .on_hover_text(format!(
+            "{name}\nDrag to reorder or pin to the taskbar\nShift-click to open another window"
+        ));
     if response.drag_started_by(egui::PointerButton::Primary) {
         egui::DragAndDrop::set_payload(ui.ctx(), id);
     }
@@ -237,6 +256,14 @@ mod tests {
         self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, TextureId, Vec2,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn clicking_a_running_app_activates_or_offers_its_windows() {
+        assert_eq!(icon_action(0, false), IconAction::Launch);
+        assert_eq!(icon_action(1, false), IconAction::Activate);
+        assert_eq!(icon_action(2, false), IconAction::Choose);
+        assert_eq!(icon_action(2, true), IconAction::Launch);
+    }
 
     #[test]
     fn icons_wrap_at_the_configured_row_length() {

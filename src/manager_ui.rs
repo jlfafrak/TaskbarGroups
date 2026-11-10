@@ -68,6 +68,10 @@ fn startup_buttons(ui: &mut egui::Ui, enabled: Option<bool>) -> (egui::Response,
 
 impl eframe::App for Manager {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if platform::installer_shutdown_requested() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let window = frame
             .window_handle()
@@ -296,6 +300,17 @@ impl eframe::App for Manager {
                                 match self.store.move_app(group.id, app.id, 1) { Ok(true) => self.save_group(group.id, group.apps.first().map(|first| first.id)), Ok(false) => {}, Err(e) => self.status = e }
                             }
                             if icon_button(ui, ActionIcon::Remove, true).clicked() { self.store.groups[index].apps.retain(|item| item.id != app.id); self.save_group(group.id, group.apps.first().map(|first| first.id)); }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(40.0);
+                            let mut hide = app.hide_taskbar_button;
+                            if ui.checkbox(&mut hide, "Hide taskbar button")
+                                .on_hover_text("Hide this app's running button from the taskbar")
+                                .changed()
+                                && let Some(current) = self.store.groups[index].apps.iter_mut().find(|item| item.id == app.id) {
+                                    current.hide_taskbar_button = hide;
+                                    self.save();
+                            }
                         });
                     });
                     ui.add_space(4.0);

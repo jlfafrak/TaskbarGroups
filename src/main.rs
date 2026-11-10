@@ -2,9 +2,11 @@
 
 mod drag_ghost;
 mod flyout_ui;
+mod managed_windows;
 mod manager_ui;
 mod platform;
 mod theme;
+mod window_matching;
 use eframe::egui::{self, Color32};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
@@ -22,6 +24,25 @@ fn store_path() -> PathBuf {
 fn main() -> eframe::Result {
     platform::enable_dpi_awareness();
     let args: Vec<String> = std::env::args().collect();
+    platform::initialize_installer_shutdown();
+    if args.get(1).is_some_and(|s| s == "--window-guardian") {
+        if let (Some(parent), Some(path), Some(session), Some(ready)) = (
+            args.get(2).and_then(|s| s.parse().ok()),
+            args.get(3),
+            args.get(4),
+            args.get(5),
+        ) && managed_windows::guardian(parent, Path::new(path), session, ready).is_ok()
+        {
+            return Ok(());
+        }
+        std::process::exit(1);
+    }
+    if args.get(1).is_some_and(|s| s == "--installer-shutdown") {
+        if platform::request_installer_shutdown().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.get(1).is_some_and(|s| s == "--watch") {
         platform::watch(&store_path());
         return Ok(());
@@ -197,6 +218,8 @@ impl Manager {
 
 struct Popup {
     group: taskbar_groups::Group,
+    running: std::collections::HashMap<Uuid, Vec<window_matching::RunningWindow>>,
+    choosing: Option<Uuid>,
     icons_per_row: usize,
     textures: std::collections::HashMap<Uuid, egui::TextureHandle>,
     focused_once: bool,
@@ -213,13 +236,37 @@ struct Popup {
     theme: theme::ThemeTracker,
 }
 impl Popup {
+    fn resize_for_chooser(&mut self, ctx: &egui::Context, choosing: bool) {
+        let (width, height) = if choosing {
+            (360.0, 300.0)
+        } else {
+            let (width, height) =
+                taskbar_groups::flyout_size_with_columns(self.group.apps.len(), self.icons_per_row);
+            (
+                width,
+                height
+                    + if self.drag_source.is_some() {
+                        36.0
+                    } else {
+                        0.0
+                    },
+            )
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+        self.position = self
+            .anchor
+            .and_then(|anchor| platform::position_at_anchor_sized(anchor, width, height));
+    }
+
     fn replace_group(
         &mut self,
         ctx: &egui::Context,
         group: taskbar_groups::Group,
         icons_per_row: usize,
     ) {
-        if self.group.apps.len() != group.apps.len() || self.icons_per_row != icons_per_row {
+        if self.choosing.is_none()
+            && (self.group.apps.len() != group.apps.len() || self.icons_per_row != icons_per_row)
+        {
             let (width, height) =
                 taskbar_groups::flyout_size_with_columns(group.apps.len(), icons_per_row);
             let extra_height = if self.drag_source.is_some() {
@@ -307,9 +354,14 @@ impl eframe::App for Popup {
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
         let dragging = egui::DragAndDrop::has_payload_of_type::<Uuid>(ui.ctx());
+        if !dragging && !external_drag_active && platform::installer_shutdown_requested() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         if !dragging && self.last_refresh.elapsed() >= std::time::Duration::from_millis(500) {
             self.last_refresh = std::time::Instant::now();
             if let Ok(store) = Store::load(&store_path()) {
+                self.running = running_by_app(&store);
                 if let Some(group) = store
                     .groups
                     .into_iter()
@@ -330,11 +382,11 @@ impl eframe::App for Popup {
             self.hover_entered = true;
         }
         let elapsed = self.last_hover.elapsed().as_millis();
-        if (self.hover_entered
+        let should_close = (self.hover_entered
             && taskbar_groups::should_dismiss_hover(on_anchor, on_popup, elapsed))
             || (!self.hover_entered && elapsed >= 3000)
-            || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
-        {
+            || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
+        if should_close {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if let Some(focused) = ui.ctx().input(|i| i.viewport().focused) {
@@ -345,11 +397,46 @@ impl eframe::App for Popup {
             }
         }
         let mut reorder = None;
+        let mut action = None;
         egui::Frame::new()
             .fill(colors.flyout)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
+                if let Some(id) = self.choosing {
+                    if let Some(app) = self.group.apps.iter().find(|app| app.id == id) {
+                        ui.horizontal(|ui| {
+                            if ui.button("Back").clicked() {
+                                action = Some(PopupAction::Back);
+                            }
+                            ui.strong(&app.name);
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height((ui.available_height() - 42.0).max(0.0))
+                            .show(ui, |ui| {
+                                if let Some(windows) = self.running.get(&id) {
+                                    for window in windows {
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width(), 32.0],
+                                                egui::Button::new(&window.title),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(PopupAction::Activate(window.clone()));
+                                        }
+                                    }
+                                }
+                            });
+                        if ui.button("Open another window").clicked() {
+                            action = Some(PopupAction::Launch(app.path.clone()));
+                        }
+                    } else {
+                        action = Some(PopupAction::Back);
+                    }
+                    return;
+                }
                 if let Some((name, path)) = &self.drag_source {
                     let texture = self.drag_texture.get_or_insert_with(|| {
                         let image = platform::icon(&path.to_string_lossy()).unwrap_or_else(|| {
@@ -394,16 +481,39 @@ impl eframe::App for Popup {
                                 });
                                 let response =
                                     flyout_ui::render_icon(ui, app.id, &app.name, tex.id());
+                                let windows = self
+                                    .running
+                                    .get(&app.id)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or_default();
+                                if !windows.is_empty() {
+                                    ui.painter().circle_filled(
+                                        egui::pos2(
+                                            response.rect.center().x,
+                                            response.rect.bottom() - 4.0,
+                                        ),
+                                        2.0,
+                                        colors.text,
+                                    );
+                                }
                                 items.push((app.id, response.rect));
                                 if response.clicked() {
-                                    if let Err(e) = platform::launch(&app.path) {
-                                        let _ = rfd::MessageDialog::new()
-                                            .set_title("Unable to launch")
-                                            .set_description(e)
-                                            .show();
-                                    } else {
-                                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                                    }
+                                    action = Some(
+                                        match flyout_ui::icon_action(
+                                            windows.len(),
+                                            ui.input(|i| i.modifiers.shift),
+                                        ) {
+                                            flyout_ui::IconAction::Launch => {
+                                                PopupAction::Launch(app.path.clone())
+                                            }
+                                            flyout_ui::IconAction::Activate => {
+                                                PopupAction::Activate(windows[0].clone())
+                                            }
+                                            flyout_ui::IconAction::Choose => {
+                                                PopupAction::Choose(app.id)
+                                            }
+                                        },
+                                    );
                                 }
                                 if response.secondary_clicked()
                                     && let Err(e) = window
@@ -456,6 +566,33 @@ impl eframe::App for Popup {
                     }
                 }
             });
+        if let Some(action) = action {
+            let result = match action {
+                PopupAction::Back => {
+                    self.choosing = None;
+                    self.resize_for_chooser(ui.ctx(), false);
+                    None
+                }
+                PopupAction::Choose(id) => {
+                    self.choosing = Some(id);
+                    self.resize_for_chooser(ui.ctx(), true);
+                    None
+                }
+                PopupAction::Launch(path) => Some(platform::launch(&path)),
+                PopupAction::Activate(window) => Some(window_matching::activate(&window)),
+            };
+            if let Some(result) = result {
+                match result {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => {
+                        let _ = rfd::MessageDialog::new()
+                            .set_title("Unable to open window")
+                            .set_description(error)
+                            .show();
+                    }
+                }
+            }
+        }
         if let Some((dragged, target, side)) = reorder {
             self.reorder(ui.ctx(), dragged, target, side);
         }
@@ -509,6 +646,24 @@ impl eframe::App for Popup {
         }
     }
 }
+
+enum PopupAction {
+    Back,
+    Choose(Uuid),
+    Launch(String),
+    Activate(window_matching::RunningWindow),
+}
+
+fn running_by_app(
+    store: &Store,
+) -> std::collections::HashMap<Uuid, Vec<window_matching::RunningWindow>> {
+    let mut running = std::collections::HashMap::<Uuid, Vec<_>>::new();
+    for (id, window) in window_matching::all_group_windows(store) {
+        running.entry(id).or_default().push(window);
+    }
+    running
+}
+
 fn run_popup(id: Option<Uuid>, args: &[String]) -> eframe::Result {
     let store = match Store::load(&store_path()) {
         Ok(s) => s,
@@ -520,6 +675,7 @@ fn run_popup(id: Option<Uuid>, args: &[String]) -> eframe::Result {
             return Ok(());
         }
     };
+    let running = running_by_app(&store);
     let icons_per_row = store.icons_per_row;
     let Some(group) = store.groups.into_iter().find(|g| Some(g.id) == id) else {
         let _ = rfd::MessageDialog::new()
@@ -596,6 +752,8 @@ fn run_popup(id: Option<Uuid>, args: &[String]) -> eframe::Result {
         Box::new(move |cc| {
             Ok(Box::new(Popup {
                 group,
+                running,
+                choosing: None,
                 icons_per_row,
                 textures: Default::default(),
                 focused_once: false,

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?ifndef ProductName ?><?define ProductName="Taskbar Groups" ?><?endif?>
+<?ifndef InstallDirName ?><?define InstallDirName="Taskbar Groups" ?><?endif?>
+<?ifndef UpgradeId ?><?define UpgradeId="588028B7-EA1B-4291-8CD5-683B9D08567E" ?><?endif?>
+<?ifndef AppComponentId ?><?define AppComponentId="0E83F7E8-B74B-40FB-85E8-D54246BF1661" ?><?endif?>
+<?ifndef ShortcutComponentId ?><?define ShortcutComponentId="88E511F4-C7DC-4C3A-91AA-92AA783847CB" ?><?endif?>
+<?ifndef RegistryName ?><?define RegistryName="TaskbarGroups" ?><?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.ProductName)" Manufacturer="Taskbar Groups" Version="$(var.ProductVersion)"
+           UpgradeCode="$(var.UpgradeId)" Scope="perUser" Language="1033">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="LIMITUI" Value="1" />
+    <Property Id="INSTALLEDEXE">
+      <DirectorySearch Id="ExistingInstallDirectory" Path="[LocalAppDataFolder]Programs\$(var.InstallDirName)" Depth="0">
+        <FileSearch Id="ExistingApplication" Name="taskbar-groups.exe" />
+      </DirectorySearch>
+    </Property>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDirectory" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="$(var.InstallDirName)">
+          <Component Id="Application" Guid="$(var.AppComponentId)">
+            <File Id="ApplicationExe" Source="$(var.AppExe)" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="$(var.ShortcutComponentId)">
+        <Shortcut Id="LaunchTaskbarGroups" Name="$(var.ProductName)"
+                  Target="[#ApplicationExe]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Taskbar Groups\Installer\$(var.RegistryName)"
+                       Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="$(var.ProductName)" Level="1">
+      <ComponentRef Id="Application" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <CustomAction Id="StopRunningApp" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]taskbar-groups.exe&quot; --installer-shutdown"
+                  Execute="immediate" Return="check" />
+    <CustomAction Id="RestartWatcher" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]taskbar-groups.exe&quot; --watch"
+                  Execute="immediate" Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="StopRunningApp" Before="InstallValidate"
+              Condition="INSTALLEDEXE AND (WIX_UPGRADE_DETECTED OR (Installed AND REMOVE = &quot;ALL&quot;)) AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RestartWatcher" After="InstallFinalize" Condition="WIX_UPGRADE_DETECTED" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

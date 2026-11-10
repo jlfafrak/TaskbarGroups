@@ -1,6 +1,42 @@
 use taskbar_groups::{DropSide, Store};
 
 #[test]
+fn legacy_apps_hide_taskbar_buttons_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("groups.json");
+    std::fs::write(&path, br#"{"groups":[{"id":"00000000-0000-0000-0000-000000000001","name":"Work","apps":[{"id":"00000000-0000-0000-0000-000000000002","name":"Editor","path":"editor.exe"}]}]}"#).unwrap();
+
+    assert!(Store::load(&path).unwrap().groups[0].apps[0].hide_taskbar_button);
+}
+
+#[test]
+fn newly_added_apps_hide_taskbar_buttons_by_default() {
+    let mut store = Store::default();
+    let group = store.add_group("Work").unwrap();
+    store.add_app(group, "Editor", "editor.exe").unwrap();
+
+    assert!(store.groups[0].apps[0].hide_taskbar_button);
+}
+
+#[test]
+fn taskbar_button_preference_is_persisted_per_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("groups.json");
+    let mut store = Store::default();
+    let group = store.add_group("Work").unwrap();
+    store.add_app(group, "Editor", "editor.exe").unwrap();
+    store.add_app(group, "Browser", "browser.exe").unwrap();
+    store.save(&path).unwrap();
+    let expected = store.clone();
+    store.groups[0].apps[0].hide_taskbar_button = false;
+    store.save_if_unchanged(&path, &expected).unwrap();
+
+    let loaded = Store::load(&path).unwrap();
+    assert!(!loaded.groups[0].apps[0].hide_taskbar_button);
+    assert!(loaded.groups[0].apps[1].hide_taskbar_button);
+}
+
+#[test]
 fn legacy_stores_default_to_four_icons_per_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("groups.json");

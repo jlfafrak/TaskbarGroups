@@ -1,0 +1,38 @@
+{
+  "targets": {
+    "manager": {
+      "targetKind": "existing-ui",
+      "projectId": "c12e3d01-817f-4392-a9b1-8e7d0c9e5e9b",
+      "baselineDraftId": "01413a5c-83a3-4d82-b4e4-6239c3e0fdd4",
+      "activeDraftId": "4fb9d588-55a5-4dea-8392-ab2b676f3a6f",
+      "designSystemPath": ".superdesign/design-system.md",
+      "contextFiles": [
+        "src/main.rs",
+        "src/manager_ui.rs",
+        ".superdesign/init/theme.md",
+        ".superdesign/design-system.md"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "2e4df9e1767354d66c4de91564a6ac40898f9a60c66c52d260a6d915751baddc",
+        "src/main.rs": "be57df3277b753cec0e55906fe38a255d546493726e285b5d37906237fe732a3",
+        ".superdesign/init/theme.md": "b3c8b04b2e744a2aea024f3fe75007804661ea0bcdc584f64a8e7962e85caf1e",
+        "src/manager_ui.rs": "596f140d06c64ae81596637846ff6c2cfcfdf64e0a393cccb3a45a83f2e6c755"
+      },
+      "drafts": {
+        "4fb9d588-55a5-4dea-8392-ab2b676f3a6f": {
+          "visualDirection": "high-contrast slate desktop utility",
+          "currentVersion": 1,
+          "title": "Taskbar Groups Modernized UI",
+          "parentDraftId": "01413a5c-83a3-4d82-b4e4-6239c3e0fdd4"
+        },
+        "01413a5c-83a3-4d82-b4e4-6239c3e0fdd4": {
+          "visualDirection": "existing egui manager",
+          "currentVersion": 1,
+          "title": "Current manager baseline"
+        }
+      },
+      "updatedAt": "2026-10-30T21:10:43.9635286Z"
+    }
+  },
+  "schemaVersion": 1
+}

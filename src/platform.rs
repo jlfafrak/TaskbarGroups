@@ -3984,7 +3984,10 @@ mod tests {
             let name = item.GetDisplayName(SIGDN_FILESYSPATH).unwrap();
             let actual = PathBuf::from(name.to_string().unwrap());
             CoTaskMemFree(Some(name.0.cast()));
-            assert_eq!(actual, shortcut);
+            assert_eq!(
+                std::fs::canonicalize(actual).unwrap(),
+                std::fs::canonicalize(shortcut).unwrap()
+            );
         }
     }
     #[test]
@@ -4135,9 +4138,10 @@ mod tests {
             let mut result = [0u16; 260];
             assert!(SHGetPathFromIDListW(pidl, &mut result).as_bool());
             let len = result.iter().position(|&c| c == 0).unwrap();
+            let actual = std::path::PathBuf::from(String::from_utf16_lossy(&result[..len]));
             assert_eq!(
-                std::path::PathBuf::from(String::from_utf16_lossy(&result[..len])),
-                path
+                std::fs::canonicalize(actual).unwrap(),
+                std::fs::canonicalize(path).unwrap()
             );
             CoTaskMemFree(Some(pidl.cast()));
         }

@@ -11,6 +11,16 @@ pub struct WindowKey {
     pub pid: u32,
     pub process_started: u64,
     pub marker: String,
+    #[serde(default)]
+    pub identity: Option<IdentityChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityChange {
+    pub app: uuid::Uuid,
+    pub group: uuid::Uuid,
+    pub original: Option<String>,
+    pub assigned: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

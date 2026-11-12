@@ -1,4 +1,4 @@
-use taskbar_groups::window_recovery::{RecoveryJournal, WindowKey};
+use taskbar_groups::window_recovery::{IdentityChange, RecoveryJournal, WindowKey};
 
 fn window(hwnd: isize, pid: u32, started: u64) -> WindowKey {
     WindowKey {
@@ -6,7 +6,44 @@ fn window(hwnd: isize, pid: u32, started: u64) -> WindowKey {
         pid,
         process_started: started,
         marker: format!("test-{hwnd}-{started}"),
+        identity: None,
     }
+}
+
+#[test]
+fn identity_change_is_recorded_before_grouping_and_survives_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("windows.json");
+    let mut entry = window(42, 30, 123);
+    entry.identity = Some(IdentityChange {
+        app: uuid::Uuid::from_u128(1),
+        group: uuid::Uuid::from_u128(2),
+        original: Some("Original.Application".into()),
+        assigned: "TaskbarGroups.Group".into(),
+    });
+    let mut journal = RecoveryJournal::load(&path).unwrap();
+    journal
+        .hide(&entry, || {
+            assert_eq!(
+                RecoveryJournal::load(&path).unwrap().entries(),
+                std::slice::from_ref(&entry)
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn old_journal_entries_remain_readable_for_legacy_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("windows.json");
+    std::fs::write(
+        &path,
+        r#"{"windows":[{"hwnd":42,"pid":30,"process_started":123,"marker":"test"}]}"#,
+    )
+    .unwrap();
+    let journal = RecoveryJournal::load(&path).unwrap();
+    assert_eq!(journal.entries()[0].identity, None);
 }
 
 #[test]

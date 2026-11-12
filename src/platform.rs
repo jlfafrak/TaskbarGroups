@@ -2437,6 +2437,38 @@ fn snapshot_precedes_press(captured: Instant, press: Instant) -> bool {
         .checked_duration_since(captured)
         .is_some_and(|age| age <= Duration::from_millis(500))
 }
+fn is_group_click(
+    down: POINT,
+    up: POINT,
+    bounds: windows::Win32::Foundation::RECT,
+    dragged: bool,
+    drag_width: i32,
+    drag_height: i32,
+) -> bool {
+    !dragged
+        && contains_point(bounds, down)
+        && contains_point(bounds, up)
+        && (up.x - down.x).abs() < drag_width.max(1)
+        && (up.y - down.y).abs() < drag_height.max(1)
+}
+fn group_has_managed_windows(store_path: &Path, group: uuid::Uuid) -> bool {
+    let path = crate::managed_windows::journal_path(store_path);
+    Store::with_lock(&path, || {
+        let journal = taskbar_groups::window_recovery::RecoveryJournal::load(&path)?;
+        Ok(journal.entries().iter().any(|key| {
+            key.identity
+                .as_ref()
+                .is_some_and(|change| change.group == group)
+                && crate::window_matching::window_is_same(&crate::window_matching::RunningWindow {
+                    hwnd: key.hwnd,
+                    pid: key.pid,
+                    process_started: key.process_started,
+                    title: String::new(),
+                })
+        }))
+    })
+    .unwrap_or(false)
+}
 fn should_show_pin_drag_image(flyout_visible: bool, cursor_on_taskbar: bool) -> bool {
     flyout_visible && !cursor_on_taskbar
 }
@@ -2826,6 +2858,8 @@ pub fn watch(path: &Path) {
         let mut last_snapshot = Instant::now() - Duration::from_secs(1);
         let mut button_down = false;
         let mut drag: Option<ActivePinDrag> = None;
+        let mut pressed_group: Option<(uuid::Uuid, POINT, windows::Win32::Foundation::RECT, bool)> =
+            None;
         loop {
             std::thread::sleep(Duration::from_millis(30));
             if installer_shutdown_requested() && drag.is_none() {
@@ -2846,6 +2880,13 @@ pub fn watch(path: &Path) {
             {
                 active.popup_ready = Some(Instant::now());
             }
+            if let Some((_, down, _, moved)) = pressed_group.as_mut()
+                && ((point.x - down.x).abs() >= GetSystemMetrics(SM_CXDRAG).max(1)
+                    || (point.y - down.y).abs() >= GetSystemMetrics(SM_CYDRAG).max(1))
+            {
+                *moved = true;
+            }
+            let mut clicked_group = None;
             for event in mouse_events.try_iter() {
                 match event {
                     PinInput::Down(down_point, pressed_at) => {
@@ -2862,8 +2903,33 @@ pub fn watch(path: &Path) {
                                 )
                             },
                         );
+                        pressed_group =
+                            if drag.is_none() {
+                                Store::load(path).ok().and_then(|store| {
+                                    snapshots
+                                        .iter()
+                                        .chain(previous_snapshots.iter())
+                                        .filter(|snapshot| {
+                                            snapshot_precedes_press(snapshot.captured, pressed_at)
+                                        })
+                                        .find_map(|snapshot| {
+                                            snapshot.buttons.iter().find_map(|button| {
+                                                let group = store.groups.iter().find(|group| {
+                                                    app_id(&group.id)
+                                                        .eq_ignore_ascii_case(&button.identity)
+                                                })?;
+                                                contains_point(button.bounds, down_point).then_some(
+                                                    (group.id, down_point, button.bounds, false),
+                                                )
+                                            })
+                                        })
+                                })
+                            } else {
+                                None
+                            };
                     }
                     PinInput::Cancel => {
+                        pressed_group = None;
                         if drag.take().is_some() && popup_group.is_some() {
                             if let Some(mut child) = popup.take() {
                                 let _ = child.kill();
@@ -2874,6 +2940,19 @@ pub fn watch(path: &Path) {
                     }
                     PinInput::Up(up_point, released_at) => {
                         button_down = false;
+                        if let Some((id, down, bounds, moved)) = pressed_group.take()
+                            && is_group_click(
+                                down,
+                                up_point,
+                                bounds,
+                                moved,
+                                GetSystemMetrics(SM_CXDRAG),
+                                GetSystemMetrics(SM_CYDRAG),
+                            )
+                            && group_has_managed_windows(path, id)
+                        {
+                            clicked_group = Some(id);
+                        }
                         if let Some(mut active) = drag.take() {
                             active.ghost.take();
                             let over = popup.as_ref().and_then(|child| {
@@ -3091,8 +3170,8 @@ pub fn watch(path: &Path) {
                 opened = false;
             }
             if let Some(id) = current
-                && !opened
-                && since.elapsed() >= Duration::from_millis(550)
+                && (!opened || clicked_group == Some(id))
+                && (clicked_group == Some(id) || since.elapsed() >= Duration::from_millis(550))
                 && popup_group != Some(id)
             {
                 if let Some(mut child) = popup.take() {
@@ -3143,6 +3222,48 @@ pub fn watch(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_group_click_requires_press_and_release_without_dragging() {
+        let bounds = windows::Win32::Foundation::RECT {
+            left: 100,
+            top: 100,
+            right: 150,
+            bottom: 150,
+        };
+        let down = POINT { x: 120, y: 120 };
+        assert!(is_group_click(
+            down,
+            POINT { x: 122, y: 121 },
+            bounds,
+            false,
+            8,
+            8
+        ));
+        assert!(!is_group_click(
+            down,
+            POINT { x: 130, y: 120 },
+            bounds,
+            false,
+            8,
+            8
+        ));
+        assert!(!is_group_click(
+            down,
+            POINT { x: 122, y: 121 },
+            bounds,
+            true,
+            8,
+            8
+        ));
+        assert!(!is_group_click(
+            down,
+            POINT { x: 151, y: 120 },
+            bounds,
+            false,
+            8,
+            8
+        ));
+    }
     #[test]
     fn installer_shutdown_signal_reaches_other_process_handles() {
         let name = format!("Local\\TaskbarGroupsShutdownTest-{}", uuid::Uuid::new_v4());

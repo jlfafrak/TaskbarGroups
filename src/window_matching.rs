@@ -3,6 +3,7 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+use taskbar_groups::window_recovery::WindowKey;
 use taskbar_groups::{App, Store};
 use windows::{
     Win32::{
@@ -62,7 +63,7 @@ fn identity_can_own_window(identity: &Identity, explicit_id: Option<&str>) -> bo
 
 // Absence of the property is different from failure to inspect it: an
 // uninspectable window must not be assigned to a potentially unrelated app.
-fn explicit_window_id(hwnd: HWND) -> Option<Option<String>> {
+pub(crate) fn explicit_window_id(hwnd: HWND) -> Option<Option<String>> {
     use windows::Win32::Foundation::PROPERTYKEY;
     unsafe {
         let properties: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
@@ -77,6 +78,32 @@ fn explicit_window_id(hwnd: HWND) -> Option<Option<String>> {
         let id = windows::core::BSTR::try_from(&value).ok()?.to_string();
         Some((!id.is_empty()).then_some(id))
     }
+}
+
+fn managed_window_matches(
+    key: &WindowKey,
+    window: &RunningWindow,
+    explicit_id: Option<&str>,
+    app: uuid::Uuid,
+    marker_present: bool,
+) -> bool {
+    marker_present
+        && key.hwnd == window.hwnd
+        && key.pid == window.pid
+        && key.process_started == window.process_started
+        && key.identity.as_ref().is_some_and(|change| {
+            change.app == app
+                && explicit_id.is_some_and(|id| id.eq_ignore_ascii_case(&change.assigned))
+        })
+}
+
+fn marker_present(window: HWND, marker: &str) -> bool {
+    use windows::Win32::{Foundation::HANDLE, UI::WindowsAndMessaging::GetPropW};
+    let name: Vec<u16> = std::ffi::OsStr::new(marker)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe { GetPropW(window, PCWSTR(name.as_ptr())) == HANDLE(std::ptr::dangling_mut()) }
 }
 
 // A shortcut with arguments may select a particular profile/document. It blocks
@@ -181,7 +208,7 @@ fn creation_time(process: windows::Win32::Foundation::HANDLE) -> Option<u64> {
     (started != 0).then_some(started)
 }
 
-fn process_started(pid: u32) -> Option<u64> {
+pub(crate) fn process_started(pid: u32) -> Option<u64> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let result = creation_time(process);
     let _ = unsafe { CloseHandle(process) };
@@ -242,7 +269,7 @@ fn eligible_style(style: u32, owned: bool) -> bool {
     style & WS_EX_TOOLWINDOW.0 == 0 && !owned
 }
 
-fn running_windows() -> Vec<(RunningWindow, Identity)> {
+fn running_windows() -> Vec<(RunningWindow, Identity, Option<String>)> {
     let mut handles = Vec::<isize>::new();
     if unsafe {
         EnumWindows(
@@ -300,9 +327,6 @@ fn running_windows() -> Vec<(RunningWindow, Identity)> {
                 .or_insert_with(|| process_details(pid))
                 .clone()?;
             let explicit_id = explicit_window_id(hwnd)?;
-            if !identity_can_own_window(&identity, explicit_id.as_deref()) {
-                return None;
-            }
             Some((
                 RunningWindow {
                     hwnd: raw,
@@ -311,6 +335,7 @@ fn running_windows() -> Vec<(RunningWindow, Identity)> {
                     process_started,
                 },
                 identity,
+                explicit_id,
             ))
         })
         .collect()
@@ -329,7 +354,10 @@ fn allowed_identities(candidates: &[AppIdentity]) -> Vec<(uuid::Uuid, Identity)>
         .collect()
 }
 
-fn matched_windows(apps: impl IntoIterator<Item = App>) -> Vec<(uuid::Uuid, RunningWindow)> {
+fn matched_windows(
+    apps: impl IntoIterator<Item = App>,
+    journal: &[WindowKey],
+) -> Vec<(uuid::Uuid, RunningWindow)> {
     let _com = ComApartment::new();
     let candidates: Vec<_> = apps
         .into_iter()
@@ -338,16 +366,34 @@ fn matched_windows(apps: impl IntoIterator<Item = App>) -> Vec<(uuid::Uuid, Runn
     let allowed = allowed_identities(&candidates);
     running_windows()
         .into_iter()
-        .filter_map(|(window, identity)| unique_owner(&allowed, &identity).map(|id| (id, window)))
+        .filter_map(|(window, identity, explicit)| {
+            let id = unique_owner(&allowed, &identity)?;
+            let hwnd = HWND(window.hwnd as *mut _);
+            (identity_can_own_window(&identity, explicit.as_deref())
+                || journal.iter().any(|key| {
+                    managed_window_matches(
+                        key,
+                        &window,
+                        explicit.as_deref(),
+                        id,
+                        marker_present(hwnd, &key.marker),
+                    )
+                }))
+            .then_some((id, window))
+        })
         .collect()
 }
 
-pub(crate) fn all_group_windows(store: &Store) -> Vec<(uuid::Uuid, RunningWindow)> {
+pub(crate) fn all_group_windows(
+    store: &Store,
+    journal: &[WindowKey],
+) -> Vec<(uuid::Uuid, RunningWindow)> {
     matched_windows(
         store
             .groups
             .iter()
             .flat_map(|group| group.apps.iter().cloned()),
+        journal,
     )
 }
 
@@ -385,6 +431,56 @@ pub(crate) fn window_is_same(window: &RunningWindow) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regrouped_window_is_recognized_only_with_its_record_and_marker() {
+        let window = RunningWindow {
+            hwnd: 21,
+            pid: 22,
+            process_started: 23,
+            title: "Window".into(),
+        };
+        let app = uuid::Uuid::from_u128(1);
+        let key = taskbar_groups::window_recovery::WindowKey {
+            hwnd: 21,
+            pid: 22,
+            process_started: 23,
+            marker: "marker".into(),
+            identity: Some(taskbar_groups::window_recovery::IdentityChange {
+                app,
+                group: uuid::Uuid::from_u128(2),
+                original: None,
+                assigned: "group-id".into(),
+            }),
+        };
+        assert!(managed_window_matches(
+            &key,
+            &window,
+            Some("group-id"),
+            app,
+            true
+        ));
+        assert!(!managed_window_matches(
+            &key,
+            &window,
+            Some("group-id"),
+            app,
+            false
+        ));
+        assert!(!managed_window_matches(
+            &key,
+            &window,
+            Some("other-id"),
+            app,
+            true
+        ));
+        assert!(!managed_window_matches(
+            &key,
+            &window,
+            Some("group-id"),
+            uuid::Uuid::from_u128(3),
+            true
+        ));
+    }
     #[test]
     fn a_distinct_window_app_id_does_not_inherit_executable_ownership() {
         let exe = Identity::Executable("c:/apps/browser.exe".into());

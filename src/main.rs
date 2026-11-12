@@ -658,7 +658,16 @@ fn running_by_app(
     store: &Store,
 ) -> std::collections::HashMap<Uuid, Vec<window_matching::RunningWindow>> {
     let mut running = std::collections::HashMap::<Uuid, Vec<_>>::new();
-    for (id, window) in window_matching::all_group_windows(store) {
+    let path = managed_windows::journal_path(&store_path());
+    let journal = Store::with_lock(&path, || {
+        Ok(
+            taskbar_groups::window_recovery::RecoveryJournal::load(&path)?
+                .entries()
+                .to_vec(),
+        )
+    })
+    .unwrap_or_default();
+    for (id, window) in window_matching::all_group_windows(store, &journal) {
         running.entry(id).or_default().push(window);
     }
     running
